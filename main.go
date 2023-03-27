@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -19,6 +20,7 @@ type cell struct {
 	row       int
 	value_str string
 	value_int int
+	tfcell    *xlsx.Cell
 }
 
 func main() {
@@ -31,7 +33,7 @@ func main() {
 		WorkingCoords []string
 		ControlCoords []string
 	})
-	err := confdecoder.DecodeFile("1conf.txt", tconfig) //(args[2])
+	err := confdecoder.DecodeFile(args[2], tconfig)
 	if err != nil {
 		println("Parsing template config file err: " + err.Error())
 		return
@@ -106,7 +108,7 @@ func main() {
 		}
 	}
 
-	tf, err := xlsx.OpenFile("1.xlsx") //(args[0])
+	tf, err := xlsx.OpenFile(args[0])
 	if err != nil {
 		println("Reading template file err: " + err.Error())
 		return
@@ -164,12 +166,16 @@ func main() {
 						println("Parsing template file err: ControlCoords row overflow")
 						return
 					}
-					_, err := sheet.Cell(rw, cl)
+					c, err := sheet.Cell(rw, cl)
 					if err != nil {
 						println("Parsing template file (sheet.Cell) err: " + err.Error())
 						return
 					}
-					cells = append(cells, cell{col: cl, row: rw})
+					if c.Formula() == "" {
+						cells = append(cells, cell{col: cl, row: rw, tfcell: c})
+					} else {
+						c.Value = "" // !!! иначе все формулы в нуле будут стоять
+					}
 				}
 			}
 		}
@@ -183,49 +189,58 @@ func main() {
 	}
 	convertedpath = args[3] + convertedpath
 	if err := os.Mkdir(convertedpath, 0755); err != nil {
-		println("Mkdir (convertedpath) err: " + err.Error())
-		return
+		if !errors.Is(err, os.ErrExist) {
+			println("Mkdir (convertedpath) err: " + err.Error())
+			return
+		}
 	}
 	failedpath = args[3] + failedpath
 	if err := os.Mkdir(failedpath, 0755); err != nil {
-		println("Mkdir (failedpath) err: " + err.Error())
-		return
+		if !errors.Is(err, os.ErrExist) {
+			println("Mkdir (failedpath) err: " + err.Error())
+			return
+		}
 	}
+	var sucf, totalf int
 	curpath := args[3] + "/"
 filesparsing:
 	for i := 0; i < len(files); i++ {
 		if strings.HasSuffix(strings.ToLower(files[i].Name()), ".xls") {
-			if out, err := converttoxlsx(curpath, convertedpath); err != nil {
-				println("Converttoxlsx err: " + err.Error() + "; output: " + out)
+			out, err := converttoxlsx(curpath+files[i].Name(), convertedpath)
+			if err != nil {
+				println("Converttoxlsx (file ", curpath+files[i].Name(), ") err: "+err.Error()+"; output: "+out)
 				return
 			}
+			println("Converted " + curpath + files[i].Name() + " to " + convertedpath + files[i].Name() + "x")
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(files[i].Name()), ".xlsx") {
+			totalf++
 			curfile, err := xlsx.OpenFile(curpath + files[i].Name())
 			if err != nil {
 				println("Opening xlsx err: " + err.Error())
 				return
 			}
+			// CONTROL
 			for ctrlsheetname, ctrlcells := range controlcells {
 				sht, ok := curfile.Sheet[ctrlsheetname]
 				if !ok {
 					println("File " + files[i].Name() + " does not pass control, no such sheet")
-					goto failed
+					goto failedcontrol
 				}
 				for k := 0; k < len(ctrlcells); k++ {
 					crcl, err := sht.Cell(ctrlcells[k].row, ctrlcells[k].col)
 					if err != nil {
 						println("File " + files[i].Name() + " does not pass control, sheet.Cell() err: " + err.Error())
-						goto failed
+						goto failedcontrol
 					}
 					if crcl.String() != ctrlcells[k].value_str {
 						println("File " + files[i].Name() + " does not pass control, not equal")
-						goto failed
+						goto failedcontrol
 					}
 				}
 				continue
-			failed:
+			failedcontrol:
 				src, err := os.Open(curpath + files[i].Name())
 				if err != nil {
 					println("Opening file (failed) " + files[i].Name() + " err: " + err.Error())
@@ -246,34 +261,48 @@ filesparsing:
 				}
 				src.Close()
 				dst.Close()
-				println("Failed file " + files[i].Name() + " copied to FAILED")
-				continue
+				println("File " + files[i].Name() + " failed, copied to FAILED")
+				continue filesparsing
 			}
+			println("File " + curpath + files[i].Name() + " control done")
 
+			// PARSING CELLS
 			curoutcells := make(map[*cell]int)
-
 			for sheetname, cls := range outcells {
 				sht, ok := curfile.Sheet[sheetname]
 				if !ok {
-					println("File " + files[i].Name() + " does not pass control, no such sheet")
-					goto failed2
+					println("File " + files[i].Name() + " parse err: no such sheet")
+					goto failedparsing
 				}
 				for k := 0; k < len(cls); k++ {
 					cl, err := sht.Cell(cls[k].row, cls[k].col)
 					if err != nil {
-						println("File " + files[i].Name() + " does not pass control, sheet.Cell() err: " + err.Error())
-						goto failed2
+						println("File " + files[i].Name() + " parse err: sheet.Cell() err: " + err.Error())
+						goto failedparsing
 					}
-					val, err := cl.Int()
-					if err != nil {
-						println("File " + files[i].Name() + " does not pass control, cell.Int() err: " + err.Error())
-						goto failed2
+					if cl.Formula() != "" {
+						println("File " + files[i].Name() + " parse err: formula found")
+						goto failedparsing
 					}
-					curoutcells[&cls[k]] = val
+					valstr := cl.String()
+					if valstr != "" {
+						valint, err := strconv.Atoi(valstr)
+						if err != nil {
+							println("File " + files[i].Name() + " parse err: strconv.Atoi() err: " + err.Error())
+							goto failedparsing
+						}
+						curoutcells[&cls[k]] = valint
+					}
 				}
 			}
-			////////////////////
-		failed2:
+			for cl, val := range curoutcells {
+				cl.value_int += val
+			}
+			println("File " + curpath + files[i].Name() + " parsing cells done")
+			sucf++
+			continue
+
+		failedparsing:
 			src, err := os.Open(curpath + files[i].Name())
 			if err != nil {
 				println("Opening file (failed) " + files[i].Name() + " err: " + err.Error())
@@ -299,8 +328,24 @@ filesparsing:
 	}
 	if curpath == args[3]+"/" {
 		curpath = convertedpath
+		files, err = os.ReadDir(curpath)
+		if err != nil {
+			println("ReadDir err: " + err.Error())
+			return
+		}
 		goto filesparsing
 	}
+	println("Files total: " + strconv.Itoa(totalf) + ", successfully: " + strconv.Itoa(sucf) + ", failed: " + strconv.Itoa(totalf-sucf))
+	for _, cells := range outcells {
+		for i := 0; i < len(cells); i++ {
+			cells[i].tfcell.SetInt(cells[i].value_int)
+		}
+	}
+	if err = tf.Save(args[1]); err != nil {
+		println("Saving result to " + args[1] + " err: " + err.Error())
+		return
+	}
+	println("Done! Result saved to " + args[1])
 }
 
 func converttoxlsx(filepath string, outdir string) (string, error) {
@@ -321,71 +366,3 @@ func run(path string, args []string) (out string, err error) {
 
 	return
 }
-
-// for k := len(args) - 1; k > 1; k -= 2 {
-// 	xf, err := xlsx.OpenFile(args[k])
-// 	if err != nil {
-// 		println("Reading xlsx file err: " + err.Error())
-// 		return
-// 	}
-// 	if len(xf.Sheets) == 0 {
-// 		println("Reading xlsx file err: no sheets found in file") // яхз возможно ли это
-// 		return
-// 	}
-
-// 	sht := xf.Sheets[0]
-// 	for j := 0; j < len(tfd.Rows); j++ {
-// 		if tfd.Rows[j].Key == "sheet" {
-// 			shti, err := strconv.Atoi(tfd.Rows[j].Value)
-// 			if err != nil {
-// 				var ok bool
-// 				if sht, ok = xf.Sheet[tfd.Rows[j].Value]; !ok {
-// 					println("Xlsx template's config err: sheet specified neither by num nor by existing sheetname (" + args[k-1] + ")")
-// 					return
-// 				}
-// 			} else {
-// 				if len(xf.Sheets) < (shti + 1) {
-// 					println("Xlsx templates  config'err: specified sheet num is bigger than num of sheets in readed xlsx: " + strconv.Itoa(shti) + " you want (zero based), " + strconv.Itoa(len(xf.Sheets)) + " xlsx has")
-// 					return
-// 				}
-// 				sht = xf.Sheets[shti]
-// 			}
-// 			continue
-// 		}
-
-// 		if tfd.Rows[j].Key == "" || tfd.Rows[j].Value == "" {
-// 			println("Xlsx template's config err: bad row - name or value is empty")
-// 			return
-// 		}
-// 		icol, irow, err := xlsx.GetCoordsFromCellIDString(tfd.Rows[j].Value)
-// 		if err != nil {
-// 			println("Xlsx template's config err: getting coords from row value err: " + err.Error())
-// 			return
-// 		}
-// 		tag := tagopen + tfd.Rows[j].Key + tagclose
-// 		if irow >= sht.MaxRow {
-// 			println("Xlsx template's config err: specified row num in coords is bigger than num of rows in sheet, " + strconv.Itoa(irow) + " you want (zero based), " + strconv.Itoa(sht.MaxRow) + " sheet has")
-// 			return
-// 		}
-// 		if icol >= sht.MaxCol {
-// 			println("Xlsx template's config err: specified column num in coords is bigger than num of columns in sheet, " + strconv.Itoa(icol) + " you want (zero based), " + strconv.Itoa(sht.MaxCol) + " sheet has")
-// 			return
-// 		}
-// 		cell, err := sht.Cell(irow, icol)
-// 		if err != nil {
-// 			println("Xlsx template's config err: sheet.Cell() err: " + err.Error())
-// 			return
-// 		}
-// 		if err = dx.Replace(tag, cell.String(), -1); err != nil {
-// 			println("Replace err: replacing tag \"" + tag + "\" with \"" + cell.String() + "\" err: " + err.Error())
-// 			return
-// 		}
-// 		println("Replace: replaced tag \"" + tag + "\" with \"" + cell.String() + "\"")
-// 	}
-
-// }
-
-// if err = dx.WriteToFile(args[1]); err != nil {
-// 	println("Writing result file err: " + err.Error())
-// }
-// println("Done! Result written to " + args[1])
