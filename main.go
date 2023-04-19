@@ -19,8 +19,9 @@ type cell struct {
 	col       int
 	row       int
 	value_str string
-	value_int int
-	tfcell    *xlsx.Cell
+	//value_int  int
+	value_float float64
+	tfcell      *xlsx.Cell
 }
 
 func main() {
@@ -267,7 +268,7 @@ filesparsing:
 			println("File " + curpath + files[i].Name() + " control done")
 
 			// PARSING CELLS
-			curoutcells := make(map[*cell]int)
+			curoutcells := make(map[*cell]float64)
 			for sheetname, cls := range outcells {
 				sht, ok := curfile.Sheet[sheetname]
 				if !ok {
@@ -276,27 +277,28 @@ filesparsing:
 				}
 				for k := 0; k < len(cls); k++ {
 					cl, err := sht.Cell(cls[k].row, cls[k].col)
+					origcoords := xlsx.GetCellIDStringFromCoords(cls[k].col, cls[k].row)
 					if err != nil {
-						println("File " + files[i].Name() + " parse err: sheet.Cell() err: " + err.Error())
+						println("File "+files[i].Name()+" parse err: sheet.Cell() err: "+err.Error(), ", coords: "+origcoords)
 						goto failedparsing
 					}
 					if cl.Formula() != "" {
-						println("File " + files[i].Name() + " parse err: formula found")
+						println("File "+files[i].Name()+" parse err: formula found: "+cl.Formula(), ", coords: "+origcoords)
 						goto failedparsing
 					}
 					valstr := cl.String()
 					if valstr != "" {
-						valint, err := strconv.Atoi(valstr)
+						valflt, err := cl.Float()
 						if err != nil {
-							println("File " + files[i].Name() + " parse err: strconv.Atoi() err: " + err.Error())
+							println("File "+files[i].Name()+" parse err: cl.Float() err: "+err.Error(), ", coords: "+origcoords)
 							goto failedparsing
 						}
-						curoutcells[&cls[k]] = valint
+						curoutcells[&cls[k]] = valflt
 					}
 				}
 			}
 			for cl, val := range curoutcells {
-				cl.value_int += val
+				cl.value_float += val
 			}
 			println("File " + curpath + files[i].Name() + " parsing cells done")
 			sucf++
@@ -336,16 +338,33 @@ filesparsing:
 		goto filesparsing
 	}
 	println("Files total: " + strconv.Itoa(totalf) + ", successfully: " + strconv.Itoa(sucf) + ", failed: " + strconv.Itoa(totalf-sucf))
+	// SET RESULT
 	for _, cells := range outcells {
 		for i := 0; i < len(cells); i++ {
-			cells[i].tfcell.SetInt(cells[i].value_int)
+			if cells[i].value_float == 0 {
+				cells[i].tfcell.Value = ""
+				continue
+			}
+			if isInt(cells[i].value_float) {
+				cells[i].tfcell.SetInt(int(cells[i].value_float))
+			} else {
+				cells[i].tfcell.SetFloat(cells[i].value_float)
+			}
 		}
 	}
-	if err = tf.Save(args[1]); err != nil {
+	outname := args[1]
+	if !strings.HasSuffix(outname, ".xlsx") {
+		outname = outname + ".xlsx"
+	}
+	if err = tf.Save(outname); err != nil {
 		println("Saving result to " + args[1] + " err: " + err.Error())
 		return
 	}
-	println("Done! Result saved to " + args[1])
+	println("Done! Result saved to " + outname)
+}
+
+func isInt(val float64) bool {
+	return float64(int(val)) == val
 }
 
 func converttoxlsx(filepath string, outdir string) (string, error) {

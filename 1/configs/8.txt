@@ -1,0 +1,2 @@
+WorkingCoords 0-C6:J7,0-C13:M14
+ControlCoords 0-A4:J5,0-A11:M12

@@ -1,0 +1,2 @@
+WorkingCoords 0-B7:AW23
+ControlCoords 0-A7:A23
